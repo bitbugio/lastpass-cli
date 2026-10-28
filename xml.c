@@ -38,6 +38,7 @@
 #include "blob.h"
 #include "feature-flag.h"
 #include <string.h>
+#include <strings.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <errno.h>
@@ -651,4 +652,236 @@ int xml_parse_share_get_limits(const char *buf, struct share_limit *limit)
 free_doc:
 	xmlFreeDoc(doc);
 	return ret;
+}
+
+/*
+ * Classify one share.php status word.
+ * Return 1 for an OK value, -1 for a failure, and 0 when the text
+ * is not a status (for example a numeric id).
+ */
+static int share_status_value(const char *val)
+{
+	size_t i;
+
+	if (!val || !val[0])
+		return 0;
+
+	if (!strcasecmp(val, "ok") || !strcasecmp(val, "success") ||
+	    !strcasecmp(val, "true") || !strcasecmp(val, "yes") ||
+	    !strcmp(val, "1"))
+		return 1;
+
+	if (!strcasecmp(val, "fail") || !strcasecmp(val, "failed") ||
+	    !strcasecmp(val, "failure") || !strcasecmp(val, "error") ||
+	    !strcasecmp(val, "denied") || !strcasecmp(val, "no") ||
+	    !strcasecmp(val, "false") || !strcmp(val, "0"))
+		return -1;
+
+	for (i = 0; val[i]; i++) {
+		if (val[i] < '0' || val[i] > '9')
+			return -1;
+	}
+	return 0;
+}
+
+static bool xml_tag_is(const xmlChar *tag, const char *name)
+{
+	return tag && !strcasecmp((const char *)tag, name);
+}
+
+static void trim_inplace(char *text)
+{
+	char *start;
+	char *end;
+
+	if (!text)
+		return;
+
+	start = text;
+	while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')
+		start++;
+	if (start != text)
+		memmove(text, start, strlen(start) + 1);
+
+	end = text + strlen(text);
+	while (end > text && (end[-1] == ' ' || end[-1] == '\t' ||
+			      end[-1] == '\n' || end[-1] == '\r'))
+		end--;
+	*end = '\0';
+}
+
+static char *xml_node_text(xmlDoc *doc, xmlNode *node)
+{
+	if (!node)
+		return NULL;
+	return (char *)xmlNodeListGetString(doc, node->children, 1);
+}
+
+static char *xml_attr_text(xmlDoc *doc, xmlNode *node, const char *name)
+{
+	for (xmlAttrPtr attr = node->properties; attr; attr = attr->next) {
+		if (xml_tag_is(attr->name, name))
+			return (char *)xmlNodeListGetString(doc, attr->children, 1);
+	}
+	return NULL;
+}
+
+struct share_reply_scan {
+	bool failed;
+	bool from_error;
+	char *message;
+};
+
+static void share_reply_set_message(struct share_reply_scan *scan, char *text,
+				    bool from_error)
+{
+	if (!text)
+		return;
+
+	trim_inplace(text);
+	if (!text[0]) {
+		free(text);
+		return;
+	}
+
+	if (!scan->message) {
+		scan->message = text;
+		scan->from_error = from_error;
+		return;
+	}
+	if (from_error && !scan->from_error) {
+		free(scan->message);
+		scan->message = text;
+		scan->from_error = true;
+		return;
+	}
+	free(text);
+}
+
+static void share_reply_note_status(struct share_reply_scan *scan, char *val)
+{
+	int status;
+
+	if (!val)
+		return;
+
+	trim_inplace(val);
+	status = share_status_value(val);
+	if (status < 0) {
+		scan->failed = true;
+		share_reply_set_message(scan, val, false);
+		return;
+	}
+	free(val);
+}
+
+static void scan_share_reply_node(xmlDoc *doc, xmlNode *node,
+				  struct share_reply_scan *scan)
+{
+	for (; node; node = node->next) {
+		char *err_attr;
+
+		if (node->type != XML_ELEMENT_NODE)
+			continue;
+
+		if (xml_tag_is(node->name, "error")) {
+			char *message;
+
+			scan->failed = true;
+			message = xml_attr_text(doc, node, "message");
+			trim_inplace(message);
+			if (!message || !message[0]) {
+				free(message);
+				message = xml_node_text(doc, node);
+				trim_inplace(message);
+			}
+			if (!message || !message[0]) {
+				free(message);
+				message = xml_attr_text(doc, node, "cause");
+				trim_inplace(message);
+			}
+			if (!message || !message[0]) {
+				free(message);
+				message = xml_attr_text(doc, node, "reason");
+				trim_inplace(message);
+			}
+			share_reply_set_message(scan, message, true);
+		} else if (xml_tag_is(node->name, "result") ||
+			   xml_tag_is(node->name, "status")) {
+			share_reply_note_status(scan, xml_node_text(doc, node));
+		} else if (xml_tag_is(node->name, "success")) {
+			char *text = xml_node_text(doc, node);
+
+			trim_inplace(text);
+			if (text && share_status_value(text) < 0) {
+				scan->failed = true;
+				share_reply_set_message(scan, text, false);
+			} else {
+				free(text);
+			}
+		}
+
+		share_reply_note_status(scan, xml_attr_text(doc, node, "rc"));
+		if (!xml_tag_is(node->name, "error")) {
+			share_reply_note_status(scan,
+						xml_attr_text(doc, node, "status"));
+			share_reply_note_status(scan,
+						xml_attr_text(doc, node, "result"));
+			err_attr = xml_attr_text(doc, node, "error");
+			if (err_attr) {
+				trim_inplace(err_attr);
+				if (err_attr[0]) {
+					scan->failed = true;
+					share_reply_set_message(scan, err_attr, true);
+				} else {
+					free(err_attr);
+				}
+			}
+		}
+
+		if (node->children)
+			scan_share_reply_node(doc, node->children, scan);
+	}
+}
+
+int xml_share_reply_err(const char *buf, char **message)
+{
+	xmlDoc *doc;
+	struct share_reply_scan scan;
+
+	if (message)
+		*message = NULL;
+
+	if (!buf || !buf[0]) {
+		if (message)
+			*message = xstrdup("empty reply");
+		return -EINVAL;
+	}
+
+	doc = xmlReadMemory(buf, strlen(buf), NULL, NULL,
+			   XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+	if (!doc) {
+		if (message)
+			*message = xstrdup(buf);
+		return -EINVAL;
+	}
+
+	memset(&scan, 0, sizeof(scan));
+	scan_share_reply_node(doc, xmlDocGetRootElement(doc), &scan);
+	xmlFreeDoc(doc);
+
+	if (!scan.failed) {
+		free(scan.message);
+		return 0;
+	}
+
+	if (message) {
+		if (scan.message)
+			*message = scan.message;
+		else
+			*message = xstrdup(buf);
+	} else {
+		free(scan.message);
+	}
+	return -EPERM;
 }

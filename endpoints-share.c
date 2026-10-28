@@ -114,6 +114,21 @@ int lastpass_share_get_users_by_username(const struct session *session,
 	return xml_parse_share_getpubkeys(reply, users);
 }
 
+static int check_share_reply(const char *reply, const char *action)
+{
+	_cleanup_free_ char *message = NULL;
+	int ret;
+
+	if (!reply)
+		return -EPERM;
+
+	ret = xml_share_reply_err(reply, &message);
+	if (ret)
+		die("Unable to %s: %s", action,
+		    message ? message : "unknown error");
+	return 0;
+}
+
 int lastpass_share_user_add(const struct session *session,
 			    struct share *share,
 			    struct share_user *user)
@@ -193,6 +208,12 @@ int lastpass_share_user_add(const struct session *session,
 						"xmlr", "1", NULL);
 		}
 
+		ret = check_share_reply(reply, "add user to shared folder");
+		if (ret) {
+			free(share_user);
+			return ret;
+		}
+
 		free(share_user);
 	}
 
@@ -223,11 +244,8 @@ int lastpass_share_user_mod(const struct session *session,
 				   "give", !user->hide_passwords ? "on" : "",
 				   "canadminister", user->admin ? "on" : "",
 				   "xmlr", "1", NULL);
-		   
-	if (!reply)
-		return -EPERM;
 
-	return 0;
+	return check_share_reply(reply, "modify user on shared folder");
 }
 
 int lastpass_share_user_del(const struct session *session, const char *shareid,
@@ -235,11 +253,12 @@ int lastpass_share_user_del(const struct session *session, const char *shareid,
 {
 	char *reply = NULL;
 	size_t len;
-	
+	int ret;
+
 	_cleanup_free_ char *user_id = NULL;
 
 	get_share_user_id(user, &user_id);
-	
+
 	reply = http_post_lastpass("share.php", session, &len,
 				   "token", session->token,
 				   "id", shareid,
@@ -248,8 +267,9 @@ int lastpass_share_user_del(const struct session *session, const char *shareid,
 				   "uid", user_id,
 				   "xmlr", "1", NULL);
 
+	ret = check_share_reply(reply, "remove user from shared folder");
 	free(reply);
-	return 0;
+	return ret;
 }
 
 int lastpass_share_create(const struct session *session, const char *sharename)

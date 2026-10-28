@@ -161,12 +161,17 @@ static int share_useradd(struct share_command *cmd, int argc, char **argv,
 		.admin = args->admin
 	};
 
+	int ret;
+
 	if (argc != 1)
 		die_share_usage(cmd);
 
 	new_user.username = argv[0];
-	lastpass_share_user_add(args->session, args->share, &new_user);
-	return 0;
+	ret = lastpass_share_user_add(args->session, args->share, &new_user);
+	if (ret)
+		die("Unable to add user %s to shared folder (%d)",
+		    new_user.username, ret);
+	return ret;
 }
 
 static
@@ -198,6 +203,7 @@ static int share_usermod(struct share_command *cmd, int argc, char **argv,
 			 struct share_args *args)
 {
 	struct share_user *user;
+	int ret;
 
 	if (argc != 1)
 		die_share_usage(cmd);
@@ -208,24 +214,32 @@ static int share_usermod(struct share_command *cmd, int argc, char **argv,
 		user->read_only = args->read_only;
 	if (args->set_hide_passwords)
 		user->hide_passwords = args->hide_passwords;
+
 	if (args->set_admin)
 		user->admin = args->admin;
 
-	lastpass_share_user_mod(args->session, args->share, user);
-	return 0;
+	ret = lastpass_share_user_mod(args->session, args->share, user);
+	if (ret)
+		die("Unable to modify user %s on shared folder (%d)",
+		    argv[0], ret);
+	return ret;
 }
 
 static int share_userdel(struct share_command *cmd, int argc, char **argv,
 			 struct share_args *args)
 {
 	struct share_user *found;
+	int ret;
 
 	if (argc != 1)
 		die_share_usage(cmd);
 
 	found = get_user_from_share(args->session, args->share, argv[0]);
-	lastpass_share_user_del(args->session, args->share->id, found);
-	return 0;
+	ret = lastpass_share_user_del(args->session, args->share->id, found);
+	if (ret)
+		die("Unable to remove user %s from shared folder (%d)",
+		    argv[0], ret);
+	return ret;
 }
 
 static void print_share_limits(struct blob *blob, struct share *share,
@@ -536,8 +550,8 @@ int cmd_share(int argc, char **argv)
 			die("Share %s not found.", args.sharename);
 	}
 
-	command->cmd(command, argc - optind, &argv[optind], &args);
+	int ret = command->cmd(command, argc - optind, &argv[optind], &args);
 	session_free(args.session);
 	blob_free(args.blob);
-	return 0;
+	return ret;
 }
